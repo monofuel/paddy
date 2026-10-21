@@ -91,6 +91,11 @@ sudo apt-get install -y libudev-dev libevdev-dev
 
 This is required on Ubuntu and other Debian-based systems.
 
+Systems using mdev are supported through an automatic once-per-second scan
+that also finds controllers without udev joystick metadata. Existing udev discovery and
+hotplug notifications remain active. libudev and libevdev are still required;
+applications need read access to the input device nodes.
+
 ## Intended Usage
 
 The intended model is:

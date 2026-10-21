@@ -1,7 +1,10 @@
 import
-  std/[os, posix],
+  std/[monotimes, os, posix, times],
   ../[common, internal],
   linux_defs
+
+const
+  DiscoveryIntervalMs = 1000
 
 var
   initialized: bool
@@ -10,7 +13,8 @@ var
   udevMonitor: ptr udev_monitor
   udevMonitorFd: cint
   devices: array[MaxGamepads, ptr libevdev]
-  devicePaths: array[MaxGamepads, cstring]
+  devicePaths: array[MaxGamepads, string]
+  lastDiscovery: MonoTime
   deviceAbsInfo: array[MaxGamepads, array[8, ptr input_absinfo]]
   gamepadStates: array[MaxGamepads, GamepadState]
   defaultAbsInfo =
@@ -30,7 +34,11 @@ proc resetAbsInfo(gamepadId: int) =
 
 proc strncmp(a: cstring, b: cstring, n: cint): cint {.importc, header: "<string.h>".}
 
-proc handleDeviceEvent(device: ptr udev_device, added: bool) =
+proc handleDeviceEvent(devnode, syspath: string, added: bool,
+  checkCapabilities = false)
+
+proc handleDeviceEvent(device: ptr udev_device, added: bool,
+  checkCapabilities = false) =
   ## Registers or unregisters a Linux gamepad device.
   let devnode = udev_device_get_devnode(device)
   if devnode == nil or strncmp(devnode, "/dev/input/event", 16) != 0:
@@ -39,13 +47,19 @@ proc handleDeviceEvent(device: ptr udev_device, added: bool) =
   let syspath = udev_device_get_syspath(device)
   if syspath == nil:
     return
+  handleDeviceEvent($devnode, $syspath, added, checkCapabilities)
 
+proc handleDeviceEvent(devnode, syspath: string, added: bool,
+  checkCapabilities = false) =
+  ## Share device registration between udev events and mdev discovery.
   if added:
+    if syspath in devicePaths:
+      return
     for i in 0 ..< MaxGamepads:
       if devices[i] != nil:
         continue
 
-      let fd = open(devnode, O_RDONLY or O_NONBLOCK)
+      let fd = open(devnode.cstring, O_RDONLY or O_NONBLOCK)
       if fd < 0:
         return
 
@@ -53,6 +67,13 @@ proc handleDeviceEvent(device: ptr udev_device, added: bool) =
       if libevdev_new_from_fd(fd, addr inputDevice) != 0:
         discard close(fd)
         return
+
+      if checkCapabilities:
+        if not libevdev_has_event_code(inputDevice, EV_KEY, BTN_A) and
+            not libevdev_has_event_code(inputDevice, EV_KEY, BTN_TRIGGER):
+          libevdev_free(inputDevice)
+          discard close(fd)
+          return
 
       var event = epoll_event(
         events: EPOLLIN,
@@ -88,9 +109,23 @@ proc handleDeviceEvent(device: ptr udev_device, added: bool) =
       discard close(fd)
 
       devices[i] = nil
-      devicePaths[i] = nil
+      devicePaths[i] = ""
       gamepadResetState(gamepadStates[i])
       break
+
+proc discoverDevices() =
+  ## Rescan input devices, including controllers without udev metadata.
+  for path in devicePaths:
+    if path.len > 0 and not dirExists(path):
+      handleDeviceEvent("", path, false)
+  for path in walkDirs("/sys/class/input/event*"):
+    let device = udev_device_new_from_syspath(udevCtx, path.cstring)
+    if device != nil:
+      let joystick = udev_device_get_property_value(device, "ID_INPUT_JOYSTICK")
+      if joystick == nil or joystick == "1":
+        handleDeviceEvent(device, true, checkCapabilities = joystick == nil)
+      discard udev_device_unref(device)
+  lastDiscovery = getMonoTime()
 
 proc initGamepads*() =
   ## Initializes Linux gamepad support.
@@ -154,6 +189,7 @@ proc initGamepads*() =
     discard udev_device_unref(device)
 
   discard udev_enumerate_unref(enumerate)
+  discoverDevices()
   initialized = true
 
 proc closeGamepads*() =
@@ -169,7 +205,7 @@ proc closeGamepads*() =
     libevdev_free(devices[i])
     discard close(fd)
     devices[i] = nil
-    devicePaths[i] = nil
+    devicePaths[i] = ""
     gamepadResetState(gamepadStates[i])
     resetAbsInfo(i)
 
@@ -192,6 +228,9 @@ proc pollGamepads*(): seq[Gamepad] =
   if not initialized:
     initGamepads()
 
+  if (getMonoTime() - lastDiscovery).inMilliseconds >= DiscoveryIntervalMs:
+    discoverDevices()
+
   for i in 0 ..< MaxGamepads:
     let state = addr gamepadStates[i]
     state.pressed = 0'u32
@@ -204,6 +243,11 @@ proc pollGamepads*(): seq[Gamepad] =
   let eventCount = epoll_wait(epollFd, addr events[0], maxEvents, 0)
 
   for i in 0 ..< eventCount:
+    if (events[i].events and EPOLLHUP) != 0:
+      let index = events[i].data.u32
+      if index < MaxGamepads and devices[index] != nil:
+        handleDeviceEvent("", devicePaths[index], false)
+      continue
     if (events[i].events and EPOLLIN) == 0:
       continue
 
@@ -238,6 +282,9 @@ proc pollGamepads*(): seq[Gamepad] =
 
     while true:
       let rc = libevdev_next_event(device, readFlag, addr inputEvent)
+      if rc == -ENODEV:
+        handleDeviceEvent("", devicePaths[index], false)
+        break
       if rc == LIBEVDEV_READ_STATUS_SYNC:
         readFlag = LIBEVDEV_READ_FLAG_SYNC
       elif rc == -EAGAIN:
@@ -380,7 +427,8 @@ proc pollGamepads*(): seq[Gamepad] =
       else:
         discard
 
-    gamepadUpdateButtons(state[], buttons)
+    if devices[index] != nil:
+      gamepadUpdateButtons(state[], buttons)
 
   for i in 0 ..< MaxGamepads:
     if devices[i] != nil:
