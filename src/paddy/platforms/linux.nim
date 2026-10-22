@@ -1,10 +1,11 @@
 import
-  std/[monotimes, os, posix, times],
+  std/[monotimes, os, posix, strutils, times],
   ../[common, internal],
   linux_defs
 
 const
   DiscoveryIntervalMs = 1000
+  CapabilityWordBits = sizeof(culong) * 8
 
 var
   initialized: bool
@@ -122,6 +123,16 @@ proc discoverDevices() =
     var syspath: string
     try:
       syspath = expandFilename(path)
+      # Opening and closing non-controllers can stall on kernel input cleanup.
+      let keys = readFile(path / "device/capabilities/key").splitWhitespace()
+      var controller = false
+      for button in [BTN_A, BTN_TRIGGER]:
+        let word = keys.high - button div CapabilityWordBits
+        if word >= 0 and (parseHexInt(keys[word]).uint and
+            (1'u shl (button mod CapabilityWordBits))) != 0:
+          controller = true
+      if not controller:
+        continue
     except OSError as error:
       if error.errorCode == ENOENT:
         continue
