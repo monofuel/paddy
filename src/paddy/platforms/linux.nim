@@ -119,12 +119,15 @@ proc discoverDevices() =
     if path.len > 0 and not dirExists(path):
       handleDeviceEvent("", path, false)
   for path in walkDirs("/sys/class/input/event*"):
-    let device = udev_device_new_from_syspath(udevCtx, path.cstring)
-    if device != nil:
-      let joystick = udev_device_get_property_value(device, "ID_INPUT_JOYSTICK")
-      if joystick == nil or joystick == "1":
-        handleDeviceEvent(device, true, checkCapabilities = joystick == nil)
-      discard udev_device_unref(device)
+    var syspath: string
+    try:
+      syspath = expandFilename(path)
+    except OSError as error:
+      if error.errorCode == ENOENT:
+        continue
+      raise
+    handleDeviceEvent("/dev/input/" & path.extractFilename(), syspath,
+      true, checkCapabilities = true)
   lastDiscovery = getMonoTime()
 
 proc initGamepads*() =
